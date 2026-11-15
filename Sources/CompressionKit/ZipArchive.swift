@@ -15,34 +15,70 @@ public enum ZipArchive {
 
     // MARK: - Actions
     /// Unpacks every file in `archive` into `destination`, keeping its folders. macOS's `__MACOSX` resource forks
-    /// are skipped, and an entry whose path would land outside `destination` is refused.
+    /// are skipped, and an entry whose path would land outside `destination` is refused. The first entry that can't
+    /// be unpacked stops it; `extractSkippingFailures(_:to:)` carries on past it.
     public static func extract(_ archive: URL, to destination: URL) throws {
+        try extract(archive, to: destination) { _, error in
+            throw error
+        }
+    }
+
+    /// Unpacks `archive` into `destination` like `extract(_:to:)`, but entry by entry: one that can't be unpacked,
+    /// such as a damaged, password-protected or Deflate64 file, one whose name is too long for the disk, or one that
+    /// would land outside `destination`, is skipped and reported, and the rest are still unpacked. Throws only when
+    /// the archive itself can't be read.
+    public static func extractSkippingFailures(_ archive: URL, to destination: URL) throws -> ZipExtraction {
+        var failures: [ZipEntryFailure] = []
+
+        let files = try extract(archive, to: destination) { path, error in
+            failures.append(ZipEntryFailure(path: path, error: error))
+        }
+
+        return ZipExtraction(files: files, failures: failures)
+    }
+
+    // MARK: - Helpers
+    /// Unpacks the entries one at a time, handing each one that can't be unpacked to `failed`, which throws to stop
+    /// or returns to skip it. Returns the files unpacked.
+    @discardableResult
+    private static func extract(
+        _ archive: URL,
+        to destination: URL,
+        failed: (_ path: String, _ error: any Error) throws -> Void
+    ) throws -> [URL] {
         let handle = try FileHandle(forReadingFrom: archive)
         defer { try? handle.close() }
 
         let root = destination.standardizedFileURL
+        var files: [URL] = []
 
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 
         for entry in try entries(in: handle) {
             guard !entry.path.hasPrefix("__MACOSX/") else { continue }
 
-            let url = root.appending(path: entry.path).standardizedFileURL
+            do {
+                let url = root.appending(path: entry.path).standardizedFileURL
 
-            guard url.path.hasPrefix(root.path + "/") else {
-                throw ZipError.unsafePath(entry.path)
-            }
+                guard url.path.hasPrefix(root.path + "/") else {
+                    throw ZipError.unsafePath(entry.path)
+                }
 
-            if entry.isDirectory {
-                try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-            } else {
-                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try extract(entry, from: handle, to: url)
+                if entry.isDirectory {
+                    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+                } else {
+                    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try extract(entry, from: handle, to: url)
+                    files.append(url)
+                }
+            } catch {
+                try failed(entry.path, error)
             }
         }
+
+        return files
     }
 
-    // MARK: - Helpers
     /// The entries the central directory lists, found through the end-of-directory record at the archive's end.
     private static func entries(in handle: FileHandle) throws -> [Entry] {
         let size = try handle.seekToEnd()
@@ -86,7 +122,8 @@ public enum ZipArchive {
         return entries
     }
 
-    /// Streams one entry's data from the archive to `url`, inflating it if it's deflated, and checks its CRC.
+    /// Streams one entry's data from the archive to `url`, inflating it if it's deflated, and checks its CRC. A file
+    /// that isn't unpacked whole is removed, so a damaged one is never mistaken for the real thing.
     private static func extract(_ entry: Entry, from handle: FileHandle, to url: URL) throws {
         guard !entry.isEncrypted else { throw ZipError.encrypted }
         guard entry.method == 0 || entry.method == 8 else { throw ZipError.unsupportedMethod(entry.method) }
@@ -97,10 +134,20 @@ public enum ZipArchive {
 
         let dataStart = entry.localHeaderOffset + 30 + UInt64(header.uint16(at: 26)) + UInt64(header.uint16(at: 28))
 
-        FileManager.default.createFile(atPath: url.path, contents: nil)
+        // `createFile` only returns false, so an empty file is written instead, which throws why it can't be made,
+        // as when its name is too long.
+        try Data().write(to: url)
 
         let output = try FileHandle(forWritingTo: url)
-        defer { try? output.close() }
+        var isComplete = false
+
+        defer {
+            try? output.close()
+
+            if !isComplete {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
 
         var checksum = CRC32()
         var written: UInt64 = 0
@@ -143,6 +190,8 @@ public enum ZipArchive {
         guard written == entry.uncompressedSize, checksum.value == entry.crc else {
             throw ZipError.corrupt
         }
+
+        isComplete = true
     }
 
     private static func read(_ handle: FileHandle, at offset: UInt64, count: Int) throws -> Data {
